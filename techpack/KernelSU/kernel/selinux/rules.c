@@ -58,16 +58,18 @@ extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
 // reset avc cache table, otherwise the new rules will not take effect if already denied
 static void reset_avc_cache()
 {
+	u32 seqno = selinux_state.ss ? ++selinux_state.ss->latest_granting : 1;
+
 #if ((!defined(KSU_COMPAT_USE_SELINUX_STATE)) || \
 	LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
-    avc_ss_reset(0);
-    selnl_notify_policyload(0);
-    selinux_status_update_policyload(0);
+    avc_ss_reset(seqno);
+    selnl_notify_policyload(seqno);
+    selinux_status_update_policyload(seqno);
 #else
     struct selinux_avc *avc = selinux_state.avc;
-    avc_ss_reset(avc, 0);
-    selnl_notify_policyload(0);
-    selinux_status_update_policyload(&selinux_state, 0);
+    avc_ss_reset(avc, seqno);
+    selnl_notify_policyload(seqno);
+    selinux_status_update_policyload(&selinux_state, seqno);
 #endif
     selinux_xfrm_notify_policyload();
 }
@@ -172,6 +174,13 @@ static int apply_kernelsu_rules_fn(void *ptr)
     ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
     ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
 
+    // use memfd created by su domain
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "execute");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "map");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "read");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "write");
+
     // bootctl
     ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
     ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "read");
@@ -245,6 +254,7 @@ out_unlock:
 		goto has_current_mm;
 
 	apply_kernelsu_rules_fn((void *)db);
+	ksu_policydb_fixup_len(db, "apply_kernelsu_rules");
 	goto out_unlock;
 
 has_current_mm:
@@ -259,16 +269,19 @@ has_current_mm:
 	apply_kernelsu_rules_fn((void *)db);
 	sched_setscheduler_nocheck(current, old_policy, &old_param); // restore
 
+	ksu_policydb_fixup_len(db, "apply_kernelsu_rules");
+
 out_unlock:
 	preempt_disable();
 	write_unlock(lock);
 	set_cpus_allowed_ptr(current, &old_mask);
-	goto out_flush;
+	goto out_reset_avc;
 
 do_stop_machine:
 	stop_machine(apply_kernelsu_rules_fn, (void *)db, NULL);
+	ksu_policydb_fixup_len(db, "apply_kernelsu_rules");
 
-out_flush:
+out_reset_avc:
 	smp_mb();
 	reset_avc_cache();
 #endif
@@ -347,7 +360,7 @@ static int sepol_require_not_all(const char *value, const char *name)
     return -EINVAL;
 }
 
-static int sepol_expected_argc(u32 cmd)
+int sepol_expected_argc(u32 cmd)
 {
     switch (cmd) {
     case KSU_SEPOLICY_CMD_NORMAL_PERM:
@@ -706,6 +719,8 @@ static int handle_sepolicy_fn(void *data)
 			success_cmd_count++;
 		}
 
+		ret = 0;
+
 		cmd_index++;
 	}
 
@@ -778,6 +793,8 @@ has_current_mm:
 	ret = handle_sepolicy_fn((void *)&ctx);
 	sched_setscheduler_nocheck(current, old_policy, &old_param);
 
+	ksu_policydb_fixup_len(get_policydb(), "handle_sepolicy");
+
 out_unlock:
 	preempt_disable();
 	write_unlock(lock);
@@ -786,6 +803,7 @@ out_unlock:
 
 do_stop_machine:
 	ret = stop_machine(handle_sepolicy_fn, (void *)&ctx, NULL);
+	ksu_policydb_fixup_len(get_policydb(), "handle_sepolicy");
 
 out_done:
 	if (ret)
